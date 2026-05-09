@@ -41,15 +41,19 @@ ws_default_region="nbg1"     # Nuremberg, Germany — cheap, well-connected
 # shellcheck disable=SC2034
 ws_default_ssh_key=""        # auto-detected by ws_parse_args
 
-# Size → Hetzner server type mapping (May 2026 pricing, ex-VAT).
+# Size → Hetzner server type mapping. cx23/33/43 is the current Intel
+# shared-vCPU line; cpx-equivalents (AMD) and cax-equivalents (ARM) are
+# also fine — pass --type explicitly for those. The script prints the
+# live price from the Hetzner pricing API before provisioning, so the
+# numbers below are guidance only.
 # small  = evaluation only, NOT for production workloads
 # medium = the default; runs Docker + a few LXCs comfortably
 # large  = serious workloads, multiple VMs / heavy Docker / dense LXC
 ws_size_to_type() {
     case "$WS_SIZE" in
-        small)  WS_TYPE="cx22"; SIZE_DESC="2 vCPU / 4 GB / 40 GB — €4.51/mo (eval only)" ;;
-        medium) WS_TYPE="cx32"; SIZE_DESC="4 vCPU / 8 GB / 80 GB — €9.42/mo (recommended)" ;;
-        large)  WS_TYPE="cx42"; SIZE_DESC="8 vCPU / 16 GB / 160 GB — €19.69/mo" ;;
+        small)  WS_TYPE="cx23"; SIZE_DESC="2 vCPU / 4 GB / 40 GB — ~€4.51/mo (eval only)" ;;
+        medium) WS_TYPE="cx33"; SIZE_DESC="4 vCPU / 8 GB / 80 GB — ~€9.42/mo (recommended)" ;;
+        large)  WS_TYPE="cx43"; SIZE_DESC="8 vCPU / 16 GB / 160 GB — ~€19.69/mo" ;;
         *)      ws_fatal "Unknown size: $WS_SIZE" ;;
     esac
 }
@@ -76,14 +80,14 @@ Options:
                       hel1 (Helsinki), ash (Ashburn US), hil (Hillsboro US),
                       sin (Singapore). Default: nbg1.
   --size CLASS        small / medium / large. Default: medium.
-                        small  = cx22  · 2 vCPU / 4 GB / 40 GB  — €4.51/mo (eval only)
-                        medium = cx32  · 4 vCPU / 8 GB / 80 GB  — €9.42/mo (recommended)
-                        large  = cx42  · 8 vCPU / 16 GB / 160 GB — €19.69/mo
+                        small  = cx23  · 2 vCPU / 4 GB / 40 GB  — €4.51/mo (eval only)
+                        medium = cx33  · 4 vCPU / 8 GB / 80 GB  — €9.42/mo (recommended)
+                        large  = cx43  · 8 vCPU / 16 GB / 160 GB — €19.69/mo
                       4 GB is too tight for real Docker + LXC + VM workloads;
                       we default to medium. Use --size small only if you're
                       evaluating WolfStack itself with no other workloads.
   --type STR          Override --size with an explicit Hetzner server type
-                      (cx22, cx32, cx42, cpx21, cpx31, cpx41, cpx51, etc.).
+                      (cx23, cx33, cx43, cpx21, cpx31, cpx41, cpx51, etc.).
                       Run 'hcloud server-type list' for the full menu.
   --ssh-key PATH      Public SSH key to upload (default: ~/.ssh/id_ed25519.pub
                       or ~/.ssh/id_rsa.pub).
@@ -98,8 +102,8 @@ Environment:
                       via 'hcloud context create'.
 
 Examples:
-  ./bootstrap.sh                                # 3× cx32 (medium) in nbg1 ≈ €28.26/mo
-  ./bootstrap.sh --size large --region fsn1     # 3× cx42 ≈ €59.07/mo
+  ./bootstrap.sh                                # 3× cx33 (medium) in nbg1 ≈ €28.26/mo
+  ./bootstrap.sh --size large --region fsn1     # 3× cx43 ≈ €59.07/mo
   ./bootstrap.sh --type cpx41 --nodes 5         # 5× cpx41 (custom)
   ./bootstrap.sh --destroy --prefix wolfstack   # tear down
 HELP
@@ -227,10 +231,25 @@ ws_confirm "Provision ${WS_NODES}× ${WS_TYPE} in ${WS_REGION}?"
 # peers without per-node tokens.
 CLUSTER_SECRET=$(openssl rand -hex 32)
 
-# ─── Upload SSH key (idempotent) ────────────────────────────────────────────
+# ─── Upload SSH key (idempotent — name OR fingerprint match) ────────────────
+# Hetzner enforces fingerprint-uniqueness across the whole account, so a
+# create-by-name only flow blows up with `uniqueness_error` if the operator
+# has already registered the same public key under a different name (e.g.
+# their personal key from a previous setup). Look up by fingerprint first
+# and reuse whatever name the existing entry uses; only create new when no
+# match exists at all.
 KEY_NAME="${WS_PREFIX}-key"
-if hcloud ssh-key list -o noheader -o columns=name 2>/dev/null | grep -qx "$KEY_NAME"; then
-    ws_info "SSH key '$KEY_NAME' already in Hetzner — reusing"
+LOCAL_FP=$(ssh-keygen -lf "$WS_SSH_KEY" -E md5 2>/dev/null | awk '{print $2}' | sed 's/^MD5://')
+if [ -z "$LOCAL_FP" ]; then
+    ws_fatal "Could not compute MD5 fingerprint for $WS_SSH_KEY"
+fi
+
+EXISTING_NAME=$(hcloud ssh-key list -o noheader -o columns=name,fingerprint 2>/dev/null \
+    | awk -v fp="$LOCAL_FP" '$2 == fp {print $1; exit}')
+
+if [ -n "$EXISTING_NAME" ]; then
+    KEY_NAME="$EXISTING_NAME"
+    ws_info "SSH key already in Hetzner as '$KEY_NAME' (matched by fingerprint) — reusing"
 else
     ws_info "Uploading SSH key '$KEY_NAME' to Hetzner"
     hcloud ssh-key create --name "$KEY_NAME" --public-key-from-file "$WS_SSH_KEY" >/dev/null
@@ -240,11 +259,34 @@ fi
 # ─── Provision in parallel with cleanup-on-failure trap ─────────────────────
 CREATED_IDS=()
 cleanup_on_error() {
-    [ ${#CREATED_IDS[@]} -eq 0 ] && return
-    ws_warn "Provisioning aborted — tearing down ${#CREATED_IDS[@]} created VM(s)..."
-    for id in "${CREATED_IDS[@]}"; do
+    # Primary: anything we successfully tracked in CREATED_IDS.
+    # Belt-and-braces: ALSO scan Hetzner for any server whose name starts
+    # with the prefix. This catches the case where a server was created
+    # successfully but we failed to parse its ID (so it never made it
+    # into CREATED_IDS and would otherwise leak unnoticed).
+    local matched
+    matched=$(hcloud server list -o noheader -o columns=id,name 2>/dev/null \
+        | awk -v p="${WS_PREFIX}-" '$2 ~ "^"p {print $1}' || true)
+    local to_delete=()
+    if [ ${#CREATED_IDS[@]} -gt 0 ]; then
+        to_delete+=("${CREATED_IDS[@]}")
+    fi
+    if [ -n "$matched" ]; then
+        while read -r id; do
+            [ -n "$id" ] && to_delete+=("$id")
+        done <<< "$matched"
+    fi
+    if [ ${#to_delete[@]} -eq 0 ]; then
+        return
+    fi
+    # Dedupe (CREATED_IDS may overlap with the prefix scan)
+    local unique
+    unique=$(printf '%s\n' "${to_delete[@]}" | sort -u)
+    ws_warn "Provisioning aborted — tearing down servers matching '${WS_PREFIX}-*'..."
+    while read -r id; do
+        [ -z "$id" ] && continue
         hcloud server delete "$id" >/dev/null 2>&1 || true
-    done
+    done <<< "$unique"
     ws_ok "Cleanup complete."
 }
 trap 'cleanup_on_error' ERR INT TERM
@@ -270,14 +312,19 @@ for i in $(seq 1 "$WS_NODES"); do
     # We capture stdout (the new server ID + name) so we know what to
     # roll back if a later one fails.
     (
-        hcloud server create \
+        # `-o json` is the only output flag `server create` accepts in
+        # hcloud 1.64+ (older `-o noheader -o columns=...` was removed
+        # for create operations). `--quiet` suppresses the "Waiting for
+        # create_server..." progress lines that would otherwise prefix
+        # the JSON and break `jq` parsing.
+        hcloud --quiet server create \
             --name "$hn" \
             --type "$WS_TYPE" \
             --image "$IMAGE" \
             --location "$WS_REGION" \
             --ssh-key "$KEY_NAME" \
             --user-data-from-file <(printf '%s\n' "$cloud_init_yaml") \
-            -o noheader -o columns=id,name \
+            -o json \
             > "/tmp/wolfstack-hcloud-$$-$i.out" 2>&1
     ) &
     pid_to_hostname[$!]="$hn"
@@ -287,10 +334,10 @@ done
 all_ok=true
 for pid in "${!pid_to_hostname[@]}"; do
     hn="${pid_to_hostname[$pid]}"
+    out_file="/tmp/wolfstack-hcloud-$$-${hn##*-}.out"
     if wait "$pid"; then
-        out_file="/tmp/wolfstack-hcloud-$$-${hn##*-}.out"
-        id=$(awk '{print $1}' < "$out_file" 2>/dev/null || echo "")
-        if [ -n "$id" ]; then
+        id=$(jq -r '.server.id' < "$out_file" 2>/dev/null || echo "")
+        if [ -n "$id" ] && [ "$id" != "null" ]; then
             CREATED_IDS+=("$id")
             ws_ok "Created $hn (id $id)"
         else
@@ -300,10 +347,10 @@ for pid in "${!pid_to_hostname[@]}"; do
         fi
     else
         ws_err "Failed to create $hn"
-        cat "/tmp/wolfstack-hcloud-$$-${hn##*-}.out" >&2 || true
+        cat "$out_file" >&2 || true
         all_ok=false
     fi
-    rm -f "/tmp/wolfstack-hcloud-$$-${hn##*-}.out" 2>/dev/null || true
+    rm -f "$out_file" 2>/dev/null || true
 done
 
 if [ "$all_ok" != "true" ]; then
@@ -324,22 +371,15 @@ for id in "${CREATED_IDS[@]}"; do
 done
 
 # Poll port 8553 (the WolfStack dashboard) on each node. Once it's up,
-# cloud-init has finished and the node is alive.
+# cloud-init has finished and the node is alive. ws_wait_for_dashboard
+# tries HTTP first then HTTPS — fresh installs serve plain HTTP until a
+# cert is configured.
 for pair in "${PAIRS[@]}"; do
     hn="${pair%%:*}"
     ip="${pair##*:}"
     ws_info "Waiting for ${hn} (${ip}:8553) ..."
-    waited=0
-    while [ $waited -lt 600 ]; do
-        if curl -k --connect-timeout 3 -o /dev/null -s "https://${ip}:8553/" 2>/dev/null; then
-            ws_ok "${hn} is up"
-            break
-        fi
-        sleep 5
-        waited=$((waited + 5))
-    done
-    if [ $waited -ge 600 ]; then
-        ws_warn "${hn} did not come up within 10 minutes. SSH in to inspect: ssh root@${ip} 'journalctl -u wolfstack -n 50'"
+    if ! ws_wait_for_dashboard "$hn" "$ip"; then
+        echo "    Inspect with: ssh ${SSH_USER}@${ip} 'journalctl -u wolfstack -n 50'" >&2
     fi
 done
 
@@ -350,6 +390,6 @@ trap - ERR INT TERM
 # SSH into each VM, fetch its node_id, build a unified nodes.json with all
 # peers, push it back, restart wolfstack. Cluster polling reconciles state
 # within ~10 seconds.
-ws_form_cluster "$SSH_USER" "${PAIRS[@]}"
+ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
 
 ws_summary "${PAIRS[@]}"

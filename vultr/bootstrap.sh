@@ -288,21 +288,11 @@ echo ""
 for pair in "${PAIRS[@]}"; do
     hn="${pair%%:*}"
     ip="${pair##*:}"
-    waited=0
-    while [ $waited -lt 600 ]; do
-        if curl -k --connect-timeout 3 -o /dev/null -s "https://${ip}:8553/" 2>/dev/null; then
-            ws_ok "${hn} is up"
-            break
-        fi
-        sleep 5
-        waited=$((waited + 5))
-    done
-    if [ $waited -ge 600 ]; then
-        ws_warn "${hn} did not come up within 10 minutes."
-        echo "    Inspect: ssh root@${ip} 'journalctl -u wolfstack -n 50'" >&2
+    if ! ws_wait_for_dashboard "$hn" "$ip"; then
+        echo "    Inspect: ssh ${SSH_USER}@${ip} 'journalctl -u wolfstack -n 50'" >&2
     fi
 done
 
 trap - ERR INT TERM
-ws_form_cluster "$SSH_USER" "${PAIRS[@]}"
+ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
 ws_summary "${PAIRS[@]}"
