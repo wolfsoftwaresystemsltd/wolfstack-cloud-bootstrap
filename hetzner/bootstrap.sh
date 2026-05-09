@@ -230,6 +230,7 @@ ws_confirm "Provision ${WS_NODES}× ${WS_TYPE} in ${WS_REGION}?"
 # VM. ws_form_cluster relies on this being shared so the master can poll
 # peers without per-node tokens.
 CLUSTER_SECRET=$(openssl rand -hex 32)
+ROOT_PASSWORD=$(ws_generate_password)
 
 # ─── Upload SSH key (idempotent — name OR fingerprint match) ────────────────
 # Hetzner enforces fingerprint-uniqueness across the whole account, so a
@@ -307,7 +308,7 @@ ws_info "Provisioning ${WS_NODES} servers in parallel..."
 declare -A pid_to_hostname
 for i in $(seq 1 "$WS_NODES"); do
     hn="$(ws_hostname "$WS_PREFIX" "$i")"
-    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET")
+    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET" "$ROOT_PASSWORD")
     # `--user-data` accepts the YAML on stdin via process substitution.
     # We capture stdout (the new server ID + name) so we know what to
     # roll back if a later one fails.
@@ -392,4 +393,4 @@ trap - ERR INT TERM
 # within ~10 seconds.
 ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
 
-ws_summary "${PAIRS[@]}"
+WS_ROOT_PASSWORD="$ROOT_PASSWORD" ws_summary "${PAIRS[@]}"

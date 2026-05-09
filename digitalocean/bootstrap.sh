@@ -164,6 +164,7 @@ ws_confirm "Provision ${WS_NODES}× ${WS_TYPE} in ${WS_REGION}?"
 
 # Cluster secret — distributed via cloud-init for inter-node auth.
 CLUSTER_SECRET=$(openssl rand -hex 32)
+ROOT_PASSWORD=$(ws_generate_password)
 
 # ─── SSH key (idempotent) ───────────────────────────────────────────────────
 KEY_NAME="${WS_PREFIX}-key"
@@ -207,7 +208,7 @@ ws_info "Creating ${WS_NODES} Droplets in parallel..."
 declare -A pid_to_entry
 for i in $(seq 1 "$WS_NODES"); do
     hn="$(ws_hostname "$WS_PREFIX" "$i")"
-    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET")
+    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET" "$ROOT_PASSWORD")
     ud_file="/tmp/wolfstack-do-$$-$i.yaml"
     out_file="/tmp/wolfstack-do-$$-$i.out"
     printf '%s\n' "$cloud_init_yaml" > "$ud_file"
@@ -275,4 +276,4 @@ done
 
 trap - ERR INT TERM
 ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
-ws_summary "${PAIRS[@]}"
+WS_ROOT_PASSWORD="$ROOT_PASSWORD" ws_summary "${PAIRS[@]}"

@@ -164,6 +164,7 @@ fi
 ws_confirm "Provision ${WS_NODES}× ${WS_TYPE} in ${WS_REGION}?"
 
 CLUSTER_SECRET=$(openssl rand -hex 32)
+ROOT_PASSWORD=$(ws_generate_password)
 
 # ─── Pre-flight: name collision ─────────────────────────────────────────────
 existing=$(linode-cli linodes list --json 2>/dev/null | jq -r '.[].label' 2>/dev/null || echo "")
@@ -174,11 +175,12 @@ for i in $(seq 1 "$WS_NODES"); do
     fi
 done
 
-# ─── Generate a one-time root password ──────────────────────────────────────
-# Linode requires a root password at create time. cloud-init ships SSH-key-
-# only access regardless, so we generate a strong random password no human
-# ever sees and immediately discard. The user uses SSH keys to log in.
-ROOT_PASS=$(openssl rand -base64 32 | tr -d '=+/' | cut -c1-24)
+# Linode requires a root password at create time. Use ROOT_PASSWORD (the
+# same one cloud-init sets via chpasswd) so what we tell the operator
+# matches what's actually on the box. Otherwise the Linode-set password
+# would briefly disagree with the chpasswd one, then cloud-init overwrites
+# it and the operator's printed password works only after a few seconds.
+ROOT_PASS="$ROOT_PASSWORD"
 
 # ─── Provision ──────────────────────────────────────────────────────────────
 CREATED_IDS=()
@@ -197,7 +199,7 @@ ws_info "Creating ${WS_NODES} Linodes in parallel..."
 declare -A pid_to_entry
 for i in $(seq 1 "$WS_NODES"); do
     hn="$(ws_hostname "$WS_PREFIX" "$i")"
-    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET")
+    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET" "$ROOT_PASSWORD")
     ud_b64=$(printf '%s\n' "$cloud_init_yaml" | base64 | tr -d '\n')
     out_file="/tmp/wolfstack-linode-$$-$i.out"
     (
@@ -263,4 +265,4 @@ done
 
 trap - ERR INT TERM
 ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
-ws_summary "${PAIRS[@]}"
+WS_ROOT_PASSWORD="$ROOT_PASSWORD" ws_summary "${PAIRS[@]}"

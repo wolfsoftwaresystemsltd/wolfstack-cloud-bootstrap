@@ -190,19 +190,27 @@ ws_require_cli() {
 #   $1  hostname for this VM
 #   $2  WolfStack branch (master / beta)
 #   $3  cluster secret (64 hex chars from `openssl rand -hex 32`)
+#   $4  root password (set via chpasswd so the operator can log in to the
+#       dashboard, which uses PAM/crypt() against /etc/shadow)
 #
-# Note on secrecy: the cluster secret transits via the cloud provider's
-# user-data store briefly. On all providers we tested, user-data is owner-
-# scoped and removed when the VM is destroyed. Customers with regulatory
-# paranoia about credentials in metadata can fall back to the manual
-# token-paste flow (see the README).
+# Note on secrecy: the cluster secret AND root password transit via the
+# cloud provider's user-data store briefly. On all providers we tested,
+# user-data is owner-scoped and removed when the VM is destroyed.
+# Customers with regulatory paranoia about credentials in metadata can
+# fall back to the manual token-paste flow (see the README).
 ws_cloud_init() {
     local hostname="$1"
     local branch="$2"
     local cluster_secret="$3"
+    local root_password="$4"
     cat <<EOF
 #cloud-config
 package_update: false
+chpasswd:
+  expire: false
+  users:
+    - {name: root, password: "${root_password}", type: text}
+ssh_pwauth: true
 write_files:
   - path: /etc/wolfstack/custom-cluster-secret
     permissions: '0600'
@@ -211,6 +219,14 @@ write_files:
 runcmd:
   - [ bash, -c, "curl --proto '=https' -fsSL 'https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/${branch}/cloud-setup.sh' | bash -s -- --hostname '${hostname}'" ]
 EOF
+}
+
+# ─── Random password generator ──────────────────────────────────────────────
+# Returns 24 alphanumeric characters via base64 + filter. Stripped of
+# YAML-hostile characters (+, /, =, :, ", \) so it embeds cleanly into
+# cloud-init's chpasswd directive without quoting acrobatics.
+ws_generate_password() {
+    openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 24
 }
 
 # ─── Dashboard liveness probe ───────────────────────────────────────────────
@@ -440,13 +456,21 @@ ws_summary() {
     fi
     echo "  Open the dashboard (any node — the cluster view is unified):"
     echo ""
-    echo "     https://${first_ip}:8553"
+    echo "     http://${first_ip}:8553"
     echo ""
-    echo "  Login with the system user you SSH as (typically 'root' on cloud images,"
-    echo "  'ubuntu' on AWS, 'azureuser' on Azure). The login uses your distro's"
-    echo "  system password — set or reset it via SSH if needed:"
-    echo "     ssh user@${first_ip} 'sudo passwd \$USER'"
-    echo ""
+    if [ -n "${WS_ROOT_PASSWORD:-}" ]; then
+        echo "  Login:    root"
+        echo "  Password: ${WS_ROOT_PASSWORD}"
+        echo ""
+        echo "  ⚠ This password is generated once and printed nowhere else. Capture it now."
+        echo "    To rotate later: ssh root@${first_ip} 'passwd root'"
+        echo ""
+    else
+        echo "  Login with the system user you SSH as. WolfStack auths via PAM"
+        echo "  (/etc/shadow), so set or reset the password via SSH first:"
+        echo "     ssh user@${first_ip} 'sudo passwd \$USER'"
+        echo ""
+    fi
     if [ $# -gt 1 ]; then
         echo "  If a node hasn't joined within ~30 seconds, fall back to the"
         echo "  manual flow: SSH in, 'sudo cat /etc/wolfstack/join-token', then"

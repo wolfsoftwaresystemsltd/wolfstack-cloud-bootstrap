@@ -44,7 +44,11 @@ ws_size_to_type() {
 ACTION="provision"
 IMAGE_FAMILY="ubuntu-2404-lts-amd64"
 IMAGE_PROJECT="ubuntu-os-cloud"
-SSH_USER="root"   # We inject "root:<pubkey>" via ssh-keys metadata
+# Ubuntu cloud images on GCE disable root SSH; we provision an `ubuntu`
+# user via ssh-keys metadata (GCE auto-creates the user if it doesn't
+# exist). ws_form_cluster SSHes in as ubuntu and uses sudo for the
+# privileged reads (/etc/wolfstack/join-token is 0600, owner root).
+SSH_USER="ubuntu"
 BOOT_DISK_GB=100  # default if --type used directly
 
 print_help() {
@@ -178,6 +182,7 @@ fi
 ws_confirm "Provision ${WS_NODES}× ${WS_TYPE} in ${WS_REGION}?"
 
 CLUSTER_SECRET=$(openssl rand -hex 32)
+ROOT_PASSWORD=$(ws_generate_password)
 
 # ─── Firewall rule (idempotent) ─────────────────────────────────────────────
 if ! gcloud compute firewall-rules describe "$FIREWALL_RULE" >/dev/null 2>&1; then
@@ -197,7 +202,7 @@ fi
 # ─── SSH key (project-level via metadata) ───────────────────────────────────
 # Best practice: per-instance SSH key via the OS Login API or metadata.
 # We'll attach as instance metadata so each VM gets root@hostname access.
-SSH_KEY_VALUE="root:$(cat "$WS_SSH_KEY")"
+SSH_KEY_VALUE="ubuntu:$(cat "$WS_SSH_KEY")"
 
 # ─── Pre-flight: name collision ─────────────────────────────────────────────
 for i in $(seq 1 "$WS_NODES"); do
@@ -222,7 +227,7 @@ ws_info "Creating ${WS_NODES} VMs in parallel..."
 declare -A pid_to_entry
 for i in $(seq 1 "$WS_NODES"); do
     hn="$(ws_hostname "$WS_PREFIX" "$i")"
-    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET")
+    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET" "$ROOT_PASSWORD")
     ud_file="/tmp/wolfstack-gcp-$$-$i.yaml"
     out_file="/tmp/wolfstack-gcp-$$-$i.out"
     printf '%s\n' "$cloud_init_yaml" > "$ud_file"
@@ -285,4 +290,4 @@ done
 
 trap - ERR INT TERM
 ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
-ws_summary "${PAIRS[@]}"
+WS_ROOT_PASSWORD="$ROOT_PASSWORD" ws_summary "${PAIRS[@]}"

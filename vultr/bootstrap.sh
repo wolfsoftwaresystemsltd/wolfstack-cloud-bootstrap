@@ -180,6 +180,7 @@ ws_info "Ubuntu 24.04 OS id: ${OS_ID}"
 ws_confirm "Provision ${WS_NODES}× ${WS_TYPE} in ${WS_REGION}?"
 
 CLUSTER_SECRET=$(openssl rand -hex 32)
+ROOT_PASSWORD=$(ws_generate_password)
 
 # ─── SSH key (idempotent) ───────────────────────────────────────────────────
 KEY_NAME="${WS_PREFIX}-key"
@@ -221,7 +222,7 @@ ws_info "Creating ${WS_NODES} instances in parallel..."
 declare -A pid_to_entry
 for i in $(seq 1 "$WS_NODES"); do
     hn="$(ws_hostname "$WS_PREFIX" "$i")"
-    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET")
+    cloud_init_yaml=$(ws_cloud_init "$hn" "$WS_BRANCH" "$CLUSTER_SECRET" "$ROOT_PASSWORD")
     # Vultr accepts cloud-init via --userdata as base64-encoded.
     ud_b64=$(printf '%s\n' "$cloud_init_yaml" | base64 | tr -d '\n')
     out_file="/tmp/wolfstack-vultr-$$-$i.out"
@@ -295,4 +296,4 @@ done
 
 trap - ERR INT TERM
 ws_form_cluster "$SSH_USER" "$CLUSTER_SECRET" "${PAIRS[@]}"
-ws_summary "${PAIRS[@]}"
+WS_ROOT_PASSWORD="$ROOT_PASSWORD" ws_summary "${PAIRS[@]}"
